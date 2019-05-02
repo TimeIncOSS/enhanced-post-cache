@@ -11,6 +11,7 @@ class Enhanced_Post_Cache {
 	// IDs of all posts current SQL query returns
 	public $all_post_ids = false;
 	public $cache_salt = false;
+	public $cache_salt_key = 'any';
 
 	private $do_flush_cache = true;
 	private $cache_queries = true;
@@ -24,7 +25,7 @@ class Enhanced_Post_Cache {
 
 		add_action( 'switch_blog', array( $this, 'setup_for_blog' ), 10, 2 );
 
-		add_action( 'clean_term_cache', array( $this, 'flush_cache' ) );
+		add_action( 'clean_term_cache',  array( $this, 'clean_term_cache' ), 10, 2 );
 		add_action( 'clean_post_cache',  array( $this, 'clean_post_cache' ), 10, 2 );
 
 		add_action( 'deleted_post_meta', array( $this, 'update_post_meta' ), 10, 2 );
@@ -35,6 +36,7 @@ class Enhanced_Post_Cache {
 		add_action( 'wp_update_comment_count', array( $this, 'do_clear_advanced_post_cache' ) );
 
 		add_action( 'pre_get_posts', array( $this, 'pre_get_posts' ) );
+		add_action( 'parse_query', array( $this, 'parse_query' ) );
 
 		add_filter( 'posts_request_ids', array( $this, 'posts_request_ids' ) );
 		add_filter( 'posts_results', array( $this, 'posts_results' ), 10, 2 );
@@ -44,28 +46,46 @@ class Enhanced_Post_Cache {
 		if ( $new_blog_id && (int) $new_blog_id === (int) $previous_blog_id ) {
 			return;
 		}
-
+		$this->cache_salt_key = 'any';
 		$this->cache_salt = wp_cache_get( 'cache_incrementors', 'advanced_post_cache' );
 
-		if ( false === $this->cache_salt ) {
+		if ( false === $this->cache_salt || ! is_array( $this->cache_salt ) ) {
+			$this->cache_salt = array();
 			$this->set_cache_salt();
 		}
 	}
 
 	public function clean_post_cache( $post_id, $post ) {
-		if ( ! wp_is_post_revision( $post ) && ! wp_is_post_autosave( $post ) ) {
+		$post = get_post( $post );
+		if ( $post instanceof WP_Post && ! wp_is_post_revision( $post ) && ! wp_is_post_autosave( $post ) ) {
+			$this->cache_salt_key = $post->post_type;
 			$this->flush_cache();
 		}
 	}
+
 
 	public function update_post_meta( $ignored, $post_id ) {
 		$post = get_post( $post_id );
 		$this->clean_post_cache( $post_id, $post );
 	}
+	
+	public function clean_term_cache( $ids, $taxonomy_name ) {
+		$taxonomy = get_taxonomy( $taxonomy_name );
+		if ( $taxonomy ) {
+			foreach ( $taxonomy->object_type as $post_type ) {
+				if ( post_type_exists( $post_type ) ) {
+					$this->cache_salt_key = $post_type;
+					$this->flush_cache();
+				}
+			}
+		} else {
+			$this->flush_cache();
+		}
+	}
 
 	public function flush_cache() {
 		if ( $this->needs_cache_clear() ) {
-		    $this->set_cache_salt();
+			$this->set_cache_salt();
 		}
 	}
 
@@ -88,7 +108,46 @@ class Enhanced_Post_Cache {
 	 */
 	public function pre_get_posts( $wp_query ) {
 		$this->cache_queries = apply_filters( 'use_enhanced_post_cache', true, $wp_query );
-		add_filter( 'split_the_query', function() { return $this->cache_queries; } );
+		add_filter( 'split_the_query', function () {
+			return $this->cache_queries;
+		} );
+	}
+
+	/**
+	 * Hook into query early to work which post type is in use to generate different cache keys.
+	 *
+	 * @param $wp_query
+	 */
+	function parse_query( $wp_query ) {
+		if ( isset( $wp_query->query_vars['post_type'] ) ) {
+			$post_types = $wp_query->query_vars['post_type'];
+			if ( is_string( $post_types ) && $post_types !== 'any' ) {
+				$post_type = $post_types;
+			} else if ( is_array( $post_types ) && count( $post_types ) === 1 ) {
+				$post_type = array_shift( $post_types );
+			} else {
+				$post_type = 'any';
+			}
+		} else {
+			if ( $wp_query->is_attachment ) {
+				$post_type = 'attachment';
+			} elseif ( $wp_query->is_page ) {
+				$post_type = 'page';
+			} else {
+				$post_type = 'post';
+			}
+		}
+		if ( $post_type !== 'any' && ! post_type_exists( $post_type ) ) {
+			$post_type = 'any';
+		}
+
+		$this->cache_salt_key = $post_type;
+		if ( ! isset( $this->cache_salt[ $this->cache_salt_key ] ) ) {
+			$this->set_cache_salt();
+		}
+		if ( ! isset( $this->cache_salt[ $this->cache_salt_key ] ) ) {
+			$this->cache_salt_key = 'any';
+		}
 	}
 
 	/**
@@ -118,7 +177,7 @@ class Enhanced_Post_Cache {
 		}
 		$this->cache_key   = md5( $query );
 		$this->found_posts = 0;
-		$cache             = wp_cache_get( $this->cache_key . $this->cache_salt, $this->cache_group );
+		$cache             = wp_cache_get( $this->cache_key . $this->cache_salt[ $this->cache_salt_key ], $this->cache_group );
 
 		if ( ! empty( $cache ) && is_array( $cache ) ) {
 			$this->last_result  = $wpdb->last_result;
@@ -150,17 +209,19 @@ class Enhanced_Post_Cache {
 		global $wpdb;
 
 		if ( $this->is_cached() ) {
-			$posts = array_map( 'get_post', $this->all_post_ids );
+			$posts                 = array_map( 'get_post', $this->all_post_ids );
 			$wp_query->found_posts = $this->found_posts;
-			$wpdb->last_result = $this->last_result;
-			$this->last_result = array();
+			$wpdb->last_result     = $this->last_result;
+			$this->last_result     = array();
+			$this->cache_salt_key  = 'any';
 		} else {
 			$post_ids = wp_list_pluck( (array) $posts, 'ID' );
-			$value = array(
+			$value    = array(
 				'post_ids'    => $post_ids,
 				'found_posts' => $wp_query->found_posts,
 			);
-			wp_cache_set( $this->cache_key . $this->cache_salt, $value, $this->cache_group );
+			wp_cache_set( $this->cache_key . $this->cache_salt[ $this->cache_salt_key ], $value, $this->cache_group );
+
 		}
 
 		if ( $wp_query->query_vars['posts_per_page'] > -1 ) {
@@ -174,14 +235,26 @@ class Enhanced_Post_Cache {
 		return is_array( $this->all_post_ids );
 	}
 
+	/**
+	 * Set cache key for all post types.
+	 */
 	private function set_cache_salt() {
-		$this->cache_salt = microtime();
+		$list       = [ 'any', $this->cache_salt_key ];
+		$post_types = get_post_types( '', 'names' );
+		$array_key  = array_keys( $this->cache_salt );
+		$array_diff = array_diff( $post_types, $array_key );
+		$list       = array_merge( $list, $array_diff );
+		$time       = microtime();
+		$list       = array_unique( $list );
+		foreach ( $list as $key ) {
+			$this->cache_salt[ $key ] = $time;
+		}
 		wp_cache_set( 'cache_incrementors', $this->cache_salt, 'advanced_post_cache' );
 	}
 
 	private function needs_cache_clear() {
 		return $this->do_flush_cache
-			&& ! (isset( $_POST['wp-preview'] ) && 'dopreview' === $_POST['wp-preview']);
+		       && ! (isset( $_POST['wp-preview'] ) && 'dopreview' === $_POST['wp-preview']);
 	}
 }
 
